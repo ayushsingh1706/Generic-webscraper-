@@ -1,0 +1,340 @@
+
+import requests
+from bs4 import BeautifulSoup
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, PageBreak, KeepTogether
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from datetime import datetime
+from urllib.parse import urljoin, urlparse
+import re
+import os
+import time
+
+
+# ── Step 1: Discover all pages ────────────────────────────────────────────────
+def get_all_pages(start_url, max_pages=50):
+    domain = urlparse(start_url).netloc
+    visited = set()
+    to_visit = [start_url]
+    ordered = []
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    print(f"\n Discovering pages on: {domain}")
+
+    while to_visit and len(ordered) < max_pages:
+        url = to_visit.pop(0)
+        url = url.split("#")[0].rstrip("/")
+        if not url or url in visited:
+            continue
+        visited.add(url)
+
+        if re.search(r"\.(jpg|jpeg|png|gif|svg|pdf|zip|css|js|ico|xml|json)$", url, re.I):
+            continue
+
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if "text/html" not in resp.headers.get("Content-Type", ""):
+                continue
+            resp.raise_for_status()
+        except Exception as e:
+            print(f"   Skipping {url} — {e}")
+            continue
+
+        ordered.append(url)
+        print(f"   [{len(ordered)}] {url}")
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            full = urljoin(url, href).split("#")[0].rstrip("/")
+            parsed = urlparse(full)
+            if (parsed.scheme in ("http", "https")
+                    and parsed.netloc == domain
+                    and full not in visited
+                    and full not in to_visit):
+                to_visit.append(full)
+
+        time.sleep(0.5)
+
+    print(f" Total pages found: {len(ordered)}")
+    return ordered
+
+
+# ── Step 2: Extract content cleanly ──────────────────────────────────────────
+def extract_page_content(url):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+    except Exception:
+        return f"Error loading: {url}", []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Remove all junk
+    for tag in soup(["script", "style", "noscript", "iframe",
+                     "nav", "footer", "aside", "form", "button", "meta", "link"]):
+        tag.decompose()
+
+    # Full page title
+    title_tag = soup.find("title")
+    page_title = title_tag.get_text(" ", strip=True) if title_tag else url
+
+    content = []
+    seen_texts = set()
+
+    # KEY FIX: only pick direct-text elements, skip nested ones
+    # e.g. if a <li> contains a <p>, don't add both
+    all_tags = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li"]
+
+    for element in soup.find_all(all_tags):
+
+        # Skip if this element is INSIDE another content tag (avoid double text)
+        parent = element.parent
+        skip = False
+        while parent and parent.name:
+            if parent.name in all_tags:
+                skip = True
+                break
+            parent = parent.parent
+        if skip:
+            continue
+
+        # Get full joined text of element
+        text = element.get_text(separator=" ", strip=True)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if not text or len(text) < 4:
+            continue
+
+        # Skip cookie/analytics boilerplate
+        boilerplate = ["cookie", "google analytics", "privacy policy", "javascript"]
+        if any(b in text.lower() for b in boilerplate):
+            continue
+
+        if text in seen_texts:
+            continue
+        seen_texts.add(text)
+
+        content.append({"tag": element.name, "text": text})
+
+    return page_title, content
+
+
+# ── Step 3: Build the PDF ─────────────────────────────────────────────────────
+def build_pdf(all_pages_data, start_url, output_file):
+
+    doc = SimpleDocTemplate(
+        output_file,
+        pagesize=A4,
+        leftMargin=22*mm, rightMargin=22*mm,
+        topMargin=22*mm, bottomMargin=22*mm,
+    )
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    DARK   = colors.HexColor("#1a1a2e")
+    BLUE   = colors.HexColor("#2c3e7a")
+    LBLUE  = colors.HexColor("#4a90d9")
+    GRAY   = colors.HexColor("#555555")
+    LGRAY  = colors.HexColor("#888888")
+    BODY   = colors.HexColor("#2d2d2d")
+    WHITE  = colors.white
+
+    s_cover_title = ParagraphStyle("CT",
+        fontSize=24, textColor=DARK, alignment=TA_CENTER,
+        fontName="Helvetica-Bold", spaceAfter=8, leading=30)
+
+    s_cover_meta = ParagraphStyle("CM",
+        fontSize=10, textColor=LGRAY, alignment=TA_CENTER, spaceAfter=20, leading=16)
+
+    s_toc_heading = ParagraphStyle("TOCH",
+        fontSize=12, textColor=DARK, fontName="Helvetica-Bold",
+        spaceAfter=8, spaceBefore=4)
+
+    s_toc_item = ParagraphStyle("TOCI",
+        fontSize=9, textColor=BODY, leading=14, spaceAfter=1)
+
+    s_toc_url = ParagraphStyle("TOCU",
+        fontSize=7, textColor=LBLUE, leading=10,
+        leftIndent=12, spaceAfter=7, fontName="Helvetica-Oblique")
+
+    # Page section header — dark banner
+    s_section_banner = ParagraphStyle("SB",
+        fontSize=13, textColor=WHITE, backColor=DARK,
+        fontName="Helvetica-Bold",
+        spaceBefore=0, spaceAfter=0,
+        leftIndent=0, rightIndent=0,
+        borderPad=(5, 5, 5, 5),   # top right bottom left
+        leading=18)
+
+    s_section_url = ParagraphStyle("SU",
+        fontSize=8, textColor=LBLUE,
+        fontName="Helvetica-Oblique",
+        spaceAfter=10, spaceBefore=4, leading=11)
+
+    # Content styles — generous spacing so nothing overlaps
+    s_h1 = ParagraphStyle("H1",
+        fontSize=15, textColor=DARK, fontName="Helvetica-Bold",
+        spaceBefore=14, spaceAfter=6, leading=20, keepWithNext=True)
+
+    s_h2 = ParagraphStyle("H2",
+        fontSize=13, textColor=BLUE, fontName="Helvetica-Bold",
+        spaceBefore=12, spaceAfter=5, leading=18, keepWithNext=True)
+
+    s_h3 = ParagraphStyle("H3",
+        fontSize=11, textColor=GRAY, fontName="Helvetica-Bold",
+        spaceBefore=10, spaceAfter=4, leading=16, keepWithNext=True)
+
+    s_h4 = ParagraphStyle("H4",
+        fontSize=10, textColor=GRAY, fontName="Helvetica-Bold",
+        spaceBefore=8, spaceAfter=3, leading=14, keepWithNext=True)
+
+    s_body = ParagraphStyle("Body",
+        fontSize=9, textColor=BODY,
+        leading=15, spaceAfter=7, spaceBefore=2)
+
+    s_li = ParagraphStyle("Li",
+        fontSize=9, textColor=BODY,
+        leading=14, leftIndent=14, spaceAfter=4,
+        bulletIndent=5)
+
+    s_footer = ParagraphStyle("Foot",
+        fontSize=7, textColor=colors.HexColor("#bbbbbb"), alignment=TA_CENTER)
+
+    tag_map = {
+        "h1": s_h1, "h2": s_h2, "h3": s_h3,
+        "h4": s_h4, "h5": s_h4, "h6": s_h4,
+        "p": s_body, "li": s_li,
+    }
+
+    def safe(text):
+        return (text.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;"))
+
+    story = []
+
+    # ── Cover ──────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 25*mm))
+    domain = urlparse(start_url).netloc
+    story.append(Paragraph(safe(domain), s_cover_title))
+    story.append(Paragraph(
+        f"Full Website Scrape &nbsp;&nbsp;|&nbsp;&nbsp; {len(all_pages_data)} pages "
+        f"&nbsp;&nbsp;|&nbsp;&nbsp; {datetime.now().strftime('%d %B %Y, %H:%M')}",
+        s_cover_meta
+    ))
+    story.append(HRFlowable(width="100%", thickness=2, color=DARK, spaceAfter=14))
+
+    # ── Table of Contents ──────────────────────────────────────────────────────
+    story.append(Paragraph("Pages Scraped", s_toc_heading))
+    for i, (url, title, _) in enumerate(all_pages_data, 1):
+        story.append(Paragraph(f"<b>{i}.</b>  {safe(title)}", s_toc_item))
+        story.append(Paragraph(safe(url), s_toc_url))
+
+    story.append(PageBreak())
+
+    # ── One section per page ───────────────────────────────────────────────────
+    for page_num, (url, page_title, content) in enumerate(all_pages_data, 1):
+
+        # Section banner — kept together with first content block
+        header_block = [
+            Spacer(1, 2*mm),
+            Paragraph(safe(page_title), s_section_banner),
+            Paragraph(safe(url), s_section_url),
+        ]
+
+        if not content:
+            header_block.append(Paragraph("No content extracted from this page.", s_body))
+            story.append(KeepTogether(header_block))
+        else:
+            # Keep the header with the first paragraph so it never floats alone
+            first_item = content[0]
+            first_text = safe(first_item["text"])
+            first_style = tag_map.get(first_item["tag"], s_body)
+            prefix = "• " if first_item["tag"] == "li" else ""
+            try:
+                header_block.append(Paragraph(prefix + first_text, first_style))
+            except Exception:
+                pass
+            story.append(KeepTogether(header_block))
+
+            # Rest of the content
+            for item in content[1:]:
+                text  = safe(item["text"])
+                tag   = item["tag"]
+                style = tag_map.get(tag, s_body)
+                prefix = "• " if tag == "li" else ""
+                try:
+                    story.append(Paragraph(prefix + text, style))
+                except Exception:
+                    pass
+
+        # Divider + page break between sections
+        if page_num < len(all_pages_data):
+            story.append(Spacer(1, 8*mm))
+            story.append(HRFlowable(width="100%", thickness=0.5,
+                                     color=colors.HexColor("#cccccc"), spaceAfter=0))
+            story.append(PageBreak())
+
+    # ── Footer ─────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 12*mm))
+    story.append(HRFlowable(width="100%", thickness=0.5,
+                             color=colors.HexColor("#dddddd"), spaceAfter=5))
+    story.append(Paragraph(
+        f"Generated by Simple Web Scraper &nbsp;|&nbsp; {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        s_footer
+    ))
+
+    doc.build(story)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def make_filename(url):
+    name = re.sub(r"https?://", "", url)
+    name = re.sub(r"[^\w]", "_", name).strip("_")
+    name = re.sub(r"_+", "_", name)
+    return name[:50] + "_full.pdf"
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 55)
+    print("   Full Website Scraper -> PDF")
+    print("=" * 55)
+
+    url = input("\nEnter website URL: ").strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    max_pages_input = input("Max pages to scrape? (press Enter for 50): ").strip()
+    max_pages = int(max_pages_input) if max_pages_input.isdigit() else 50
+
+    output_file = make_filename(url)
+
+    try:
+        all_urls = get_all_pages(url, max_pages=max_pages)
+
+        all_pages_data = []
+        for i, page_url in enumerate(all_urls, 1):
+            print(f" Scraping [{i}/{len(all_urls)}]: {page_url}")
+            title, content = extract_page_content(page_url)
+            all_pages_data.append((page_url, title, content))
+            time.sleep(0.3)
+
+        print(f"\n Building PDF -> {output_file}")
+        build_pdf(all_pages_data, url, output_file)
+
+        print(f"\n Done! PDF saved as: {output_file}")
+        print(f" Location: {os.path.abspath(output_file)}")
+        print(f" Pages scraped: {len(all_pages_data)}")
+
+    except requests.exceptions.ConnectionError:
+        print("\n Error: Could not connect. Check your internet or the URL.")
+    except requests.exceptions.HTTPError as e:
+        print(f"\n HTTP Error: {e}")
+    except Exception as e:
+        print(f"\n Something went wrong: {e}")
